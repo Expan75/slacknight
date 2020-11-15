@@ -1,0 +1,22 @@
+# dev env
+node_modules/
+bundle.js
+npm-debug.log
+
+/.idea
+/public
+
+.env
+.envrc
+.passport.js
+.DS_Store
+
+build/
+dist/
+
+# python specific
+env/
+
+
+# Cloud credentials
+credentials.json
