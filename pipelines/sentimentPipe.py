@@ -1,27 +1,3 @@
-# This script contains the basic pipeline for processing slacknight messages
-# ApacheBeam pipe run on google dataflow utilising GCP Natural language API for sentiment analysis
-#
-# Licensed to the Apache Software Foundation (ASF) under one or more
-# contributor license agreements.  See the NOTICE file distributed with
-# this work for additional information regarding copyright ownership.
-# The ASF licenses this file to You under the Apache License, Version 2.0
-# (the "License"); you may not use this file except in compliance with
-# the License.  You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-
-"""A streaming word-counting workflow.
-"""
-
-# pytype: skip-file
-
 from __future__ import absolute_import
 
 import argparse
@@ -32,20 +8,56 @@ from past.builtins import unicode
 
 import apache_beam as beam
 import apache_beam.transforms.window as window
-from apache_beam.examples.wordcount_with_metrics import WordExtractingDoFn
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import SetupOptions
 from apache_beam.options.pipeline_options import StandardOptions
+from apache_beam.metrics import Metrics
 from apache_beam.ml.gcp import naturallanguageml as nlp
+from google.cloud import language
+from google.cloud.language import types, enums, types
 
 
 # setup pretty print
-pp = pprint.PrettyPrinter(indent=4)
+pp = pprint.PrettyPrinter(indent=2)
 
 # Features that nlp api extracts
 features = nlp.types.AnnotateTextRequest.Features(
     extract_document_sentiment=True,
 )
+
+
+@beam.typehints.with_output_types(types.AnnotateTextResponse)
+class _AnnotateTextFn(beam.DoFn):
+    def __init__(
+        self,
+        features,  # type: Union[Mapping[str, bool], types.AnnotateTextRequest.Features]
+        timeout,  # type: Optional[float]
+        metadata=None,  # type: Optional[Sequence[Tuple[str, str]]]
+    ):
+        self.features = features
+        self.timeout = timeout
+        self.metadata = metadata
+        self.api_calls = Metrics.counter(self.__class__.__name__, "api_calls")
+        self.client = None
+
+    def setup(self):
+        self.client = self._get_api_client()
+
+    @staticmethod
+    def _get_api_client():
+        # type: () -> language.LanguageServiceClient
+        return language.LanguageServiceClient()
+
+    def process(self, element):
+        response = self.client.annotate_text(
+            document=nlp.Document.to_dict(element[1]),
+            features=self.features,
+            encoding_type=element[1].encoding,
+            timeout=self.timeout,
+            metadata=self.metadata,
+        )
+        self.api_calls.inc()
+        yield (element[0], response)
 
 
 def run(argv=None, save_main_session=True):
@@ -94,21 +106,32 @@ def run(argv=None, save_main_session=True):
             pp.pprint(pcol_element)
             return pcol_element
 
+        def mergeMessageEventWithSentiment(messageEvent, messageSentiment):
+            messageEvent["messageSentiment"] = messageSentiment
+            return messageEvent
+
         parsed_messages = (
             messages
             | "decode" >> beam.Map(lambda x: x.decode("utf-8"))
             | "parse json" >> beam.Map(lambda x: json.loads(x))
-            | "debug json parse" >> beam.Map(lambda x: debug_print(x))
         )
 
         analysed_messages = (
             parsed_messages
-            | "isolate text"
-            >> beam.Map(lambda x: nlp.Document(x["text"], type="PLAIN_TEXT"))
-            | "sentiment analysis" >> nlp.AnnotateText(features)
-            | "debug sentiment" >> beam.Map(lambda x: debug_print(x))
+            | "documentify"
+            >> beam.Map(
+                lambda message: (message, nlp.Document(content=message["text"]))
+            )
+            | "sentiment analysis"
+            >> beam.ParDo(_AnnotateTextFn(features, timeout=None))
+            | "clean up object"
+            >> beam.MapTuple(
+                lambda messageEvent, messageSentiment: mergeMessageEventWithSentiment(
+                    messageEvent, messageSentiment
+                )
+            )
+            | "debugger print2" >> beam.Map(lambda x: debug_print(x))
         )
-
         # Write to PubSub.
         # pylint: disable=expression-not-assigned
         # output | beam.io.WriteToPubSub(known_args.output_topic)
