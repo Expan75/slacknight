@@ -15,6 +15,7 @@ from apache_beam.metrics import Metrics
 from apache_beam.ml.gcp import naturallanguageml as nlp
 from google.cloud import language
 from google.cloud.language import types, enums, types
+from google.protobuf.json_format import MessageToDict
 
 
 # setup pretty print
@@ -27,7 +28,7 @@ features = nlp.types.AnnotateTextRequest.Features(
 
 
 @beam.typehints.with_output_types(types.AnnotateTextResponse)
-class _AnnotateTextFn(beam.DoFn):
+class Custom_AnnotateTextFn(beam.DoFn):
     def __init__(
         self,
         features,  # type: Union[Mapping[str, bool], types.AnnotateTextRequest.Features]
@@ -107,7 +108,9 @@ def run(argv=None, save_main_session=True):
             return pcol_element
 
         def mergeMessageEventWithSentiment(messageEvent, messageSentiment):
-            messageEvent["messageSentiment"] = messageSentiment
+            for key, value in MessageToDict(messageSentiment).items():
+                messageEvent[key] = value
+
             return messageEvent
 
         parsed_messages = (
@@ -123,7 +126,7 @@ def run(argv=None, save_main_session=True):
                 lambda message: (message, nlp.Document(content=message["text"]))
             )
             | "sentiment analysis"
-            >> beam.ParDo(_AnnotateTextFn(features, timeout=None))
+            >> beam.ParDo(Custom_AnnotateTextFn(features, timeout=60))
             | "clean up object"
             >> beam.MapTuple(
                 lambda messageEvent, messageSentiment: mergeMessageEventWithSentiment(
