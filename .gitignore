@@ -3,6 +3,8 @@ node_modules/
 bundle.js
 npm-debug.log
 
+.vscode/
+
 /.idea
 /public
 
@@ -20,3 +22,4 @@ env/
 
 # Cloud credentials
 credentials.json
+

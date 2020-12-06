@@ -1,5 +1,6 @@
 from __future__ import absolute_import
 
+import os
 import argparse
 import json
 import logging
@@ -17,6 +18,12 @@ from google.cloud import language
 from google.cloud.language import types, enums, types
 from google.protobuf.json_format import MessageToDict
 
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
+# SLACK API TOKEN
+slack_token = os.getenv("SLACK_TOKEN")
+slack_client = WebClient(token=slack_token)
 
 # setup pretty print
 pp = pprint.PrettyPrinter(indent=2)
@@ -25,6 +32,51 @@ pp = pprint.PrettyPrinter(indent=2)
 features = nlp.types.AnnotateTextRequest.Features(
     extract_document_sentiment=True,
 )
+
+
+class SlackAPICallsDoFn(beam.DoFn):
+    def __init__(self, token):
+        self.client = slack_client
+        self.token = slack_token
+
+    def process(self, element):
+        new_element = element
+
+        # get details via slack api but expect errors for edge cases (self msg, bot message)
+        try:
+            res_user_detail = self.client.users_info(
+                token=self.token, user=element["user"]
+            )
+            new_element["user"] = res_user_detail["user"]
+        except:
+            new_element["user"] = {
+                "user_id": element["user"],
+                "user_relation": "No detail available for that identifier",
+            }
+
+        try:
+            res_team_detail = self.client.team_info(
+                token=self.token, user=element["team"]
+            )
+            new_element["team"] = res_team_detail["team"]
+        except:
+            new_element["team"] = {
+                "team_id": element["team"],
+                "team_relation": "No detail available for that identifier",
+            }
+
+        try:
+            res_channel_detail = self.client.conversations_info(
+                token=self.token, channel=element["channel"]
+            )
+            new_element["channel"] = res_channel_detail
+        except:
+            new_element["channel"] = {
+                "channel_id": element["channel"],
+                "channel_relation": "No detail available for that identifier",
+            }
+
+        return new_element
 
 
 @beam.typehints.with_output_types(types.AnnotateTextResponse)
@@ -59,6 +111,43 @@ class Custom_AnnotateTextFn(beam.DoFn):
         )
         self.api_calls.inc()
         yield (element[0], response)
+
+
+# Debug ingress
+def debug_print(pcol_element):
+    pp.pprint(pcol_element)
+    return pcol_element
+
+
+def parseEventTimestamp(event):
+    parsed_timestamp = event["event_ts"].split(".")[0]
+    new_event = event
+    new_event["parsed_timestamp"] = parsed_timestamp
+
+    return new_event
+
+
+def mergeMessageEventWithSentiment(messageEvent, messageSentiment):
+    """Merged the slack message event /w the sentimentResponse yielded
+    by the dataflow sentiment analys; merges into a single nice struct
+    where message and sentiment info is found.
+    """
+
+    for key, value in MessageToDict(messageSentiment).items():
+        print("msg2dict", MessageToDict(messageSentiment))
+        # condtional loop to unnest certain props
+        if key == "documentSentiment":
+            # break up magnitude and score, ensure edge cases don't break pipe
+            try:
+                score = value["score"]
+                magnitude = value["magnitude"]
+            except KeyError:
+                messageEvent["sentiment_score"] = None
+                messageEvent["sentiment_magnitude"] = None
+        else:
+            messageEvent[key] = value
+
+    return messageEvent
 
 
 def run(argv=None, save_main_session=True):
@@ -102,17 +191,6 @@ def run(argv=None, save_main_session=True):
                 topic=known_args.input_topic
             ).with_output_types(bytes)
 
-        # Debug ingress
-        def debug_print(pcol_element):
-            pp.pprint(pcol_element)
-            return pcol_element
-
-        def mergeMessageEventWithSentiment(messageEvent, messageSentiment):
-            for key, value in MessageToDict(messageSentiment).items():
-                messageEvent[key] = value
-
-            return messageEvent
-
         parsed_messages = (
             messages
             | "decode" >> beam.Map(lambda x: x.decode("utf-8"))
@@ -127,14 +205,18 @@ def run(argv=None, save_main_session=True):
             )
             | "sentiment analysis"
             >> beam.ParDo(Custom_AnnotateTextFn(features, timeout=60))
+            | "debug" >> beam.Map(lambda x: debug_print(x))
             | "clean up object"
             >> beam.MapTuple(
                 lambda messageEvent, messageSentiment: mergeMessageEventWithSentiment(
                     messageEvent, messageSentiment
                 )
             )
-            | "debugger print2" >> beam.Map(lambda x: debug_print(x))
+            | "edit timestamps to ms"
+            >> beam.Map(lambda event: parseEventTimestamp(event))
+            | "get detail info" >> beam.ParDo(SlackAPICallsDoFn(slack_client))
         )
+
         # Write to PubSub.
         # pylint: disable=expression-not-assigned
         # output | beam.io.WriteToPubSub(known_args.output_topic)
